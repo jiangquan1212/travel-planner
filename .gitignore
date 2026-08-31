@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 密钥与运行时数据（克隆后运行 python_backend/seed.py 生成）
+.env
+data/
+
+# 本地交付与临时文件
+交付材料/
+outputs/
+work/
+
+# 编辑器/系统
+.vscode/
+Thumbs.db
+.DS_Store

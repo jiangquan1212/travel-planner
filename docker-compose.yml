@@ -1,0 +1,36 @@
+# Travel Planner · 一键部署（后端 + Redis）
+# 用法：在项目根目录
+#   docker compose up -d --build
+# 需先设置环境变量 OPENAI_API_KEY（可写进 .env，docker compose 自动读取）
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: travel-planner-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  app:
+    build: .
+    container_name: travel-planner-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.deepseek.com}
+      - TP_OPENAI_MODEL=${TP_OPENAI_MODEL:-deepseek-chat}
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    volumes:
+      - ./data:/app/data   # 数据持久化（用户/偏好/对话/知识库）
+
+volumes:
+  redis-data:

@@ -1,0 +1,16 @@
+{
+  "name": "travel-planner",
+  "version": "1.0.0",
+  "description": "旅行规划平台 - 用户/管理员登录与旅行计划管理",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node scripts/seed.js",
+    "test": "node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

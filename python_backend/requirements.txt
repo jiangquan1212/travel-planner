@@ -1,0 +1,8 @@
+# Travel Planner - Python backend dependencies (keep ASCII only)
+flask>=3.0
+requests>=2.31
+pypdf>=4.0
+fpdf2>=2.7
+fastapi>=0.110
+uvicorn>=0.29
+redis>=5.0
