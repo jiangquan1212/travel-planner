@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import string
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,8 @@ from guide_store import GuideStore
 from pdf_extract import extract_pdf_text
 from tools import TOOL_DEFS, _wmo, execute_tool, summarize_tool
 from agents import llm_complete, run_multi_agent
+from rerank import rrf_rerank
+import db
 from cache import cache_get, cache_set
 
 # ---------------- 路径与配置 ----------------
@@ -64,6 +67,7 @@ PORT = int(os.environ.get("PORT", 3000))
 HOST = os.environ.get("HOST", "127.0.0.1")
 MAX_HISTORY = 20
 MAX_FILE_BYTES = 3 * 1024 * 1024
+FEEDBACK_CATEGORIES = ("建议", "问题反馈", "功能需求", "其他")
 
 SYSTEM_PROMPT = """你是"旅行规划师"，一位经验丰富的资深旅游顾问，擅长为不同人群定制多方位旅行计划。
 
@@ -177,6 +181,15 @@ class ResetRequestIn(BaseModel):
     reason: str | None = None
 
 
+class FeedbackIn(BaseModel):
+    content: str
+    category: str | None = None
+
+
+class FeedbackHandleIn(BaseModel):
+    reply: str | None = None
+
+
 class ConversationUpdateIn(BaseModel):
     title: str | None = None
     messages: list[dict] | None = None
@@ -207,28 +220,42 @@ def save_json(name, data):
 
 
 class Collection:
+    """集合存储：启用 SQLite（TP_DB_FILE）时走 db.py，否则 JSON 文件。"""
+
     def __init__(self, name):
         self.name = name
 
     def all(self):
+        if db.db_enabled():
+            return db.all(self.name)
         return load_json(self.name)
 
     def save(self, items):
-        save_json(self.name, items)
+        if db.db_enabled():
+            db.replace(self.name, items)
+        else:
+            save_json(self.name, items)
 
     def find(self, pred):
         return next((x for x in self.all() if pred(x)), None)
 
     def get(self, obj_id):
+        if db.db_enabled():
+            return db.get(self.name, obj_id)
         return self.find(lambda r: r.get("id") == obj_id)
 
     def insert(self, record):
-        items = self.all()
-        items.append(record)
-        self.save(items)
+        if db.db_enabled():
+            db.insert(self.name, record)
+        else:
+            items = self.all()
+            items.append(record)
+            self.save(items)
         return record
 
     def update(self, obj_id, patch):
+        if db.db_enabled():
+            return db.update(self.name, obj_id, patch)
         items = self.all()
         for i, r in enumerate(items):
             if r.get("id") == obj_id:
@@ -239,6 +266,8 @@ class Collection:
         return None
 
     def remove(self, obj_id):
+        if db.db_enabled():
+            return db.remove(self.name, obj_id)
         items = self.all()
         rest = [r for r in items if r.get("id") != obj_id]
         if len(rest) == len(items):
@@ -247,12 +276,18 @@ class Collection:
         return True
 
 
+# 若配置了 SQLite，初始化表结构（需在 load_dotenv 之后执行）
+db.init_schema()
+
+
 users_coll = Collection("users")
 sessions_coll = Collection("sessions")
 conversations_coll = Collection("conversations")
 audit_coll = Collection("audit")
 favorites_coll = Collection("favorites")
 reset_requests_coll = Collection("reset_requests")
+feedback_coll = Collection("feedback")
+memory_coll = Collection("memory")
 vector_store = VectorStore(DATA_DIR / "preferences.json")
 guide_store = GuideStore(DATA_DIR / "guides.json")
 
@@ -351,16 +386,70 @@ def decode_text_buffer(buf):
 
 
 def search_knowledge(user_id, query, top_k=6):
-    """统一检索：偏好 + 攻略知识库合并，按相关度排序。"""
-    merged = []
+    """统一检索：偏好 + 攻略合并，多召回后 RRF 混合重排取 Top-K。"""
+    cands = []
     for p in vector_store.search(user_id, query, 5):
-        merged.append({"kind": "pref", "text": p["text"], "score": p["score"],
-                       "tag": f"偏好[{p.get('category', '其他')}·{'★' * p.get('weight', 3)}]"})
-    for g in guide_store.search(user_id, query, 5):
-        merged.append({"kind": "guide", "text": g["text"], "score": g["score"],
-                       "tag": f"攻略[{g['filename']}]"})
-    merged.sort(key=lambda x: x["score"], reverse=True)
-    return merged[:top_k]
+        cands.append({"kind": "pref", "text": p["text"], "score": p["score"],
+                      "weight": p.get("weight", 3),
+                      "tag": f"偏好[{p.get('category', '其他')}·{'★' * p.get('weight', 3)}]"})
+    for g in guide_store.search(user_id, query, 10):  # 多召回，交给重排
+        cands.append({"kind": "guide", "text": g["text"], "score": g["score"],
+                      "tag": f"攻略[{g['filename']}]"})
+    if not cands:
+        return []
+    reranked = rrf_rerank(query, cands)
+    by_text = {c["text"]: c for c in cands}
+    out = []
+    for item in reranked:
+        c = by_text[item["text"]]
+        out.append({**c, "rrf": item["rrf"]})
+    out.sort(key=lambda x: (x["rrf"], x.get("weight", 3)), reverse=True)
+    return out[:top_k]
+
+
+def memory_texts(user_id, limit=10):
+    ms = [m for m in memory_coll.all() if m.get("userId") == user_id]
+    ms.sort(key=lambda m: m.get("createdAt", ""), reverse=True)
+    return [m["text"] for m in ms[:limit]]
+
+
+def extract_memory(user, raw_messages):
+    """从用户消息中提取长期记忆（短句），去重后存入；最多保留 30 条。"""
+    texts = [m["content"] for m in raw_messages
+             if m.get("role") == "user" and isinstance(m.get("content"), str)]
+    joined = "\n".join(t.strip() for t in texts if t.strip())
+    if len(joined) < 8:
+        return
+    try:
+        out = llm_complete([
+            {"role": "system", "content": "你是记忆提取助手。从用户消息中提取值得长期记住的旅行信息（目的地/预算/天数/人数/出发地/交通偏好/饮食偏好/游玩偏好等），只输出 JSON 字符串数组，每项不超过 40 字，最多 3 项；没有可记的则输出 []。不要输出其它内容。"},
+            {"role": "user", "content": joined[:3000]},
+        ], temperature=0.2, max_tokens=300)
+        m = re.search(r"\[[\s\S]*\]", out)
+        parsed = json.loads(m.group(0) if m else out)
+        items = []
+        for x in parsed if isinstance(parsed, list) else []:
+            if isinstance(x, str) and x.strip():
+                items.append(x.strip())
+            elif isinstance(x, dict):
+                v = x.get("value") or x.get("text") or x.get("content") or ""
+                items.append(str(v).strip())
+        items = [t[:80] for t in items if t]
+    except Exception as e:
+        print(f"[memory] 提取失败: {e}")
+        return
+    existing = {m["text"] for m in memory_coll.all() if m.get("userId") == user["id"]}
+    for it in items[:3]:
+        if it in existing:
+            continue
+        memory_coll.insert({"id": random_id(), "userId": user["id"], "text": it,
+                            "source": "chat", "createdAt": now_iso()})
+        existing.add(it)
+    # 修剪：只留最近 30 条
+    all_m = [m for m in memory_coll.all() if m.get("userId") == user["id"]]
+    all_m.sort(key=lambda m: m.get("createdAt", ""), reverse=True)
+    for m in all_m[30:]:
+        memory_coll.remove(m["id"])
 
 
 def build_system_prompt(user, history):
@@ -373,6 +462,9 @@ def build_system_prompt(user, history):
             lines = "\n".join(f"- {item['tag']} {item['text']}" for item in kbs)
             sp += (f"\n\n【个人知识库（偏好 + 攻略，按相关度从高到低）】\n{lines}\n"
                    f"请在回答时优先参考这些信息；引用攻略片段时说明来源。")
+    mem = memory_texts(user["id"], 10)
+    if mem:
+        sp += "\n\n【用户长期记忆（历次对话沉淀）】\n" + "\n".join(f"- {t}" for t in mem)
     return sp
 
 
@@ -428,6 +520,12 @@ def _dump(model):
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
+
+
+# ---------------- 健康检查（供 Docker/K8s 探活） ----------------
+@app.get("/api/health")
+def api_health():
+    return JSONResponse({"status": "ok", "service": "travel-planner"})
 
 
 # ---------------- 认证 ----------------
@@ -820,6 +918,13 @@ def api_chat(body: ChatIn, request: Request):
                 for f in futures:
                     v = futures[f]
                     result = f.result()
+                    if v["name"] == "get_weather" and isinstance(result, dict) and "error" in result:
+                        # 偶发网络失败时自动重试一次，避免行程里出现“天气获取失败”
+                        try:
+                            time.sleep(0.8)
+                            result = execute_tool(v["name"], json.loads(v["arguments"] or "{}"))
+                        except Exception:
+                            pass
                     yield sse({"type": "tool", "name": v["name"],
                                "summary": summarize_tool(v["name"], result)})
                     messages.append({"role": "tool", "tool_call_id": v["id"],
@@ -851,7 +956,10 @@ def api_chat(body: ChatIn, request: Request):
             assistant_content = "".join(assistant_parts)
 
         if assistant_content.strip():
+            conv_existed = bool(body.conversationId and conversations_coll.get(body.conversationId))
             saved_id = save_conversation(user, body.conversationId, raw_messages, assistant_content)
+            if not conv_existed:
+                extract_memory(user, raw_messages)
             yield sse({"type": "done", "conversationId": saved_id})
         else:
             yield sse({"type": "error", "message": "AI 没有返回内容，请重试"})
@@ -965,6 +1073,29 @@ def api_favorites_delete(fav_id: str, request: Request):
     return JSONResponse({"ok": True})
 
 
+# ---------------- 长期记忆管理 ----------------
+@app.get("/api/me/memory")
+def api_me_memory(request: Request):
+    user, e = require_auth(request)
+    if e:
+        return e
+    ms = [m for m in memory_coll.all() if m.get("userId") == user["id"]]
+    ms.sort(key=lambda m: m.get("createdAt", ""), reverse=True)
+    return JSONResponse({"memory": ms})
+
+
+@app.delete("/api/me/memory/{mem_id}")
+def api_me_memory_delete(mem_id: str, request: Request):
+    user, e = require_auth(request)
+    if e:
+        return e
+    mem = memory_coll.get(mem_id)
+    if not mem or mem.get("userId") != user["id"]:
+        return err(404, "记忆不存在")
+    memory_coll.remove(mem_id)
+    return JSONResponse({"ok": True})
+
+
 # ---------------- 密码重置申请 ----------------
 @app.post("/api/me/reset-request")
 def api_reset_request(body: ResetRequestIn, request: Request):
@@ -1029,6 +1160,65 @@ def api_admin_reset_reject(req_id: str, request: Request):
                                         "handler": admin.get("username", "?")})
     add_audit(admin, "拒绝重置密码", req.get("username", "?"), "拒绝用户重置申请")
     return JSONResponse({"ok": True})
+
+
+# ---------------- 意见反馈（用户 → 管理员） ----------------
+@app.post("/api/me/feedback")
+def api_feedback_add(body: FeedbackIn, request: Request):
+    user, e = require_auth(request)
+    if e:
+        return e
+    content = (body.content or "").strip()
+    if not content:
+        return err(400, "反馈内容不能为空")
+    if len(content) > 2000:
+        return err(400, "反馈内容不能超过 2000 字")
+    cat = (body.category or "其他").strip()
+    if cat not in FEEDBACK_CATEGORIES:
+        cat = "其他"
+    fb = {"id": random_id(), "userId": user["id"], "username": user.get("username", "?"),
+          "category": cat, "content": content, "status": "pending",
+          "reply": None, "createdAt": now_iso(), "handledAt": None, "handler": None}
+    feedback_coll.insert(fb)
+    add_audit(user, "提交反馈", fb["username"], f"[{cat}] {content[:40]}")
+    return JSONResponse({"feedback": fb}, status_code=201)
+
+
+@app.get("/api/me/feedback")
+def api_feedback_mine(request: Request):
+    user, e = require_auth(request)
+    if e:
+        return e
+    items = [f for f in feedback_coll.all() if f.get("userId") == user["id"]]
+    items.sort(key=lambda f: f.get("createdAt", ""), reverse=True)
+    return JSONResponse({"feedback": items})
+
+
+@app.get("/api/admin/feedback")
+def api_admin_feedback(request: Request, limit: int = 200):
+    admin, e = require_admin(request)
+    if e:
+        return e
+    items = feedback_coll.all()
+    items.sort(key=lambda f: f.get("createdAt", ""), reverse=True)
+    return JSONResponse({"feedback": items[:max(1, min(limit, 500))]})
+
+
+@app.post("/api/admin/feedback/{fb_id}/handle")
+def api_admin_feedback_handle(fb_id: str, body: FeedbackHandleIn, request: Request):
+    admin, e = require_admin(request)
+    if e:
+        return e
+    fb = feedback_coll.get(fb_id)
+    if not fb:
+        return err(404, "反馈不存在")
+    reply = (body.reply or "").strip()
+    patch = {"status": "done", "handledAt": now_iso(), "handler": admin.get("username", "?")}
+    if reply:
+        patch["reply"] = reply[:1000]
+    updated = feedback_coll.update(fb_id, patch)
+    add_audit(admin, "处理反馈", fb.get("username", "?"), reply or "标记为已处理")
+    return JSONResponse({"feedback": updated})
 
 
 # ---------------- 天气 / 导出 ----------------
@@ -1322,7 +1512,8 @@ def api_admin_audit_clear(request: Request):
 # ---------------- 静态前端 ----------------
 @app.get("/")
 def index_page():
-    resp = FileResponse(str(PUBLIC_DIR / "index.html"))
+    # Vue 3 版为唯一前端页面
+    resp = FileResponse(str(PUBLIC_DIR / "vue-app" / "index.html"))
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -1349,6 +1540,6 @@ def static_fallback(path: str):
 if __name__ == "__main__":
     import uvicorn
     print(f"[travel-planner-fastapi] 后端 API 已启动: http://{HOST}:{PORT}")
-    print(f"[travel-planner-fastapi] 前端页面:      http://{HOST}:{PORT}/")
+    print(f"[travel-planner-fastapi] 前端页面(Vue3): http://{HOST}:{PORT}/")
     print(f"[travel-planner-fastapi] AI 对话: {'已启用（' + OPENAI_MODEL + ' @ ' + OPENAI_BASE_URL + '）' if OPENAI_API_KEY else '未配置（请设置 OPENAI_API_KEY）'}")
     uvicorn.run(app, host=HOST, port=PORT)

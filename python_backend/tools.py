@@ -14,6 +14,7 @@ import os
 import requests
 
 from cache import cache_get, cache_set
+import providers
 
 OPENWEATHER = None  # 复用 main 中的天气函数（延迟注入）
 
@@ -101,7 +102,7 @@ def get_weather(city):
                          params={"latitude": loc["latitude"], "longitude": loc["longitude"],
                                  "current_weather": "true",
                                  "daily": "weathercode,temperature_2m_max,temperature_2m_min",
-                                 "timezone": "auto", "forecast_days": 3},
+                                 "timezone": "auto", "forecast_days": 5},
                          timeout=15).json()
         cur = w.get("current_weather", {})
         result = {
@@ -109,7 +110,8 @@ def get_weather(city):
             "temp": cur.get("temperature"),
             "windspeed": cur.get("windspeed"),
             "weathercode": cur.get("weathercode"),
-            "daily": [{"date": d, "tmax": w["daily"]["temperature_2m_max"][i],
+            "daily": [{"date": d, "weathercode": w["daily"]["weathercode"][i],
+                       "tmax": w["daily"]["temperature_2m_max"][i],
                        "tmin": w["daily"]["temperature_2m_min"][i]}
                       for i, d in enumerate(w["daily"]["time"])],
         }
@@ -120,7 +122,10 @@ def get_weather(city):
 
 
 def search_flights(from_city, to_city, date="2026-09-01"):
-    """确定性模拟航班列表。"""
+    """真实航班（若配置接口）否则确定性模拟。"""
+    real = providers.real_flights(from_city, to_city, date)
+    if real:
+        return real
     flights = []
     base = _seed("flight", from_city, to_city, date)
     for i in range(4):
@@ -140,11 +145,15 @@ def search_flights(from_city, to_city, date="2026-09-01"):
             "price": price,
             "cabin": "经济舱",
         })
-    return {"from": from_city, "to": to_city, "date": date, "flights": flights}
+    return {"from": from_city, "to": to_city, "date": date,
+            "source": "内置演示数据", "flights": flights}
 
 
 def search_hotels(city, checkin="2026-09-01", checkout="2026-09-03", budget=500):
-    """确定性模拟酒店列表。"""
+    """真实酒店（高德，配 AMAP_KEY）否则确定性模拟。"""
+    real = providers.real_hotels(city, 5)
+    if real:
+        return real
     hotels = []
     base = _seed("hotel", city, checkin, checkout)
     for i in range(5):
@@ -160,17 +169,20 @@ def search_hotels(city, checkin="2026-09-01", checkout="2026-09-03", budget=500)
             "in_budget": price <= budget,
         })
     return {"city": city, "checkin": checkin, "checkout": checkout,
-            "budget": budget, "hotels": hotels}
+            "budget": budget, "source": "内置演示数据", "hotels": hotels}
 
 
 def search_attractions(city):
-    """热门景点（内置库 + 兜底）。"""
+    """真实景点（高德，配 AMAP_KEY）否则内置热门库。"""
+    real = providers.real_attractions(city, 8)
+    if real:
+        return real
     pool = ATTRACTIONS.get(city) or [
         f"{city}中央公园", f"{city}老城区", f"{city}博物馆",
         f"{city}滨江步道", f"{city}地标塔",
     ]
     attrs = [{"name": n, "type": "景点", "note": "建议游玩 2-4 小时"} for n in pool]
-    return {"city": city, "attractions": attrs}
+    return {"city": city, "source": "内置数据", "attractions": attrs}
 
 
 def execute_tool(name, args):
@@ -205,8 +217,11 @@ def summarize_tool(name, result):
         hs = result.get("hotels", [])
         if not hs:
             return "酒店：暂无"
-        low = min(h["price_per_night"] for h in hs)
-        return f"酒店：{result['city']} 最低 ¥{low}/晚"
+        priced = [h["price_per_night"] for h in hs if h.get("price_per_night") is not None]
+        if not priced:
+            return f"酒店：{result.get('city', '')} {len(hs)} 家真实酒店（高德，含地址/电话）"
+        low = min(priced)
+        return f"酒店：{result.get('city', '')} 最低 ¥{low}/晚"
     if name == "search_attractions":
         return f"景点：{result['city']} {len(result.get('attractions', []))} 个推荐"
     return f"工具：{name}"

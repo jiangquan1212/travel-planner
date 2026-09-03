@@ -96,6 +96,13 @@ body {
 }
 
 .topnav { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.vue-switch {
+  font-size: 13px; font-weight: 600; color: #fff; text-decoration: none;
+  background: linear-gradient(135deg, #0ea5e9, #4f46e5);
+  padding: 6px 14px; border-radius: 999px; white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(79, 70, 229, .28); transition: transform .15s ease;
+}
+.vue-switch:hover { transform: translateY(-1px); }
 .topnav .user-chip {
   font-size: 13px;
   color: var(--muted);

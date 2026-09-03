@@ -41,3 +41,12 @@ python python_backend\main.py
 - 航班/酒店为确定性模拟数据（演示工具调用链路）；天气与地理编码为真实数据
 - Redis 可选：不配置 `REDIS_URL` 时自动回退内存缓存，功能不受影响
 - 旧 Flask 版保留在 `python_backend/app.py`，可继续使用
+
+### 真实数据
+天气使用 Open-Meteo（真实）。酒店/景点接入高德 POI（`AMAP_KEY`，免费申请），航班可配置第三方接口（`FLIGHT_API_URL/KEY`）；未配置时自动回退内置演示数据并标注 source。
+
+### RAG 重排与评测
+检索加入 RRF 混合重排（向量 + BM25），运行评测：python python_backend/eval_rag.py（Recall@1 90%→95%）。
+
+### 多 Agent 真实工具 + 长期记忆
+多 Agent 并行预取天气/航班/酒店/景点工具；对话自动沉淀长期记忆并在后续注入。接口：/api/me/memory。
