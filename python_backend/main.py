@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import string
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -37,6 +38,7 @@ from pdf_extract import extract_pdf_text
 from tools import TOOL_DEFS, _wmo, execute_tool, summarize_tool
 from agents import llm_complete, run_multi_agent
 from rerank import rrf_rerank
+from llm_log import log_llm_call
 import db
 from cache import cache_get, cache_set
 
@@ -213,8 +215,8 @@ def load_json(name):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    except Exception as e:
+        raise RuntimeError(f"读取 {name}.json 失败，文件可能已损坏：{e}")
 
 
 def save_json(name, data):
@@ -225,21 +227,44 @@ def save_json(name, data):
 
 
 class Collection:
-    """集合存储：启用 SQLite（TP_DB_FILE）时走 db.py，否则 JSON 文件。"""
+    """集合存储：启用 SQLite（TP_DB_FILE）时走 db.py，否则 JSON 文件。
+
+    ⚠️ JSON 后端是「读整个文件 → 改内存 → 写回整个文件」，读-改-写之间必须原子，
+    否则并发写会互相覆盖（实测 16 线程并发只落 1.3 条，丢 14.7 条）。
+    这里给**每个集合一把可重入锁**，把整个读-改-写圈成一个临界区。
+
+    边界（重要）：这把锁**只在进程内有效**。多 worker / 多实例部署时跨进程仍会互相覆盖，
+    那种情况必须把数据外置（Redis / 真数据库），不是加锁能解决的。
+    """
+
+    # 集合名 → 锁；不同集合之间互不阻塞
+    _locks = {}
+    _locks_guard = threading.Lock()
 
     def __init__(self, name):
         self.name = name
 
+    @classmethod
+    def _lock_for(cls, name):
+        with cls._locks_guard:
+            lock = cls._locks.get(name)
+            if lock is None:
+                lock = threading.RLock()
+                cls._locks[name] = lock
+            return lock
+
     def all(self):
         if db.db_enabled():
             return db.all(self.name)
+        # 纯读不加锁：写走「写临时文件再原子替换」，读到的要么是旧的完整文件、要么是新的完整文件
         return load_json(self.name)
 
     def save(self, items):
         if db.db_enabled():
             db.replace(self.name, items)
         else:
-            save_json(self.name, items)
+            with self._lock_for(self.name):
+                save_json(self.name, items)
 
     def find(self, pred):
         return next((x for x in self.all() if pred(x)), None)
@@ -253,31 +278,34 @@ class Collection:
         if db.db_enabled():
             db.insert(self.name, record)
         else:
-            items = self.all()
-            items.append(record)
-            self.save(items)
+            with self._lock_for(self.name):
+                items = self.all()
+                items.append(record)
+                save_json(self.name, items)
         return record
 
     def update(self, obj_id, patch):
         if db.db_enabled():
             return db.update(self.name, obj_id, patch)
-        items = self.all()
-        for i, r in enumerate(items):
-            if r.get("id") == obj_id:
-                merged = {**r, **patch, "id": obj_id}
-                items[i] = merged
-                self.save(items)
-                return merged
+        with self._lock_for(self.name):
+            items = self.all()
+            for i, r in enumerate(items):
+                if r.get("id") == obj_id:
+                    merged = {**r, **patch, "id": obj_id}
+                    items[i] = merged
+                    save_json(self.name, items)
+                    return merged
         return None
 
     def remove(self, obj_id):
         if db.db_enabled():
             return db.remove(self.name, obj_id)
-        items = self.all()
-        rest = [r for r in items if r.get("id") != obj_id]
-        if len(rest) == len(items):
-            return False
-        self.save(rest)
+        with self._lock_for(self.name):
+            items = self.all()
+            rest = [r for r in items if r.get("id") != obj_id]
+            if len(rest) == len(items):
+                return False
+            save_json(self.name, rest)
         return True
 
 
@@ -429,7 +457,7 @@ def extract_memory(user, raw_messages):
         out = llm_complete([
             {"role": "system", "content": "你是记忆提取助手。从用户消息中提取值得长期记住的旅行信息（目的地/预算/天数/人数/出发地/交通偏好/饮食偏好/游玩偏好等），只输出 JSON 字符串数组，每项不超过 40 字，最多 3 项；没有可记的则输出 []。不要输出其它内容。"},
             {"role": "user", "content": joined[:3000]},
-        ], temperature=0.2, max_tokens=300)
+        ], temperature=0.2, max_tokens=300, role="记忆提取")
         m = re.search(r"\[[\s\S]*\]", out)
         parsed = json.loads(m.group(0) if m else out)
         items = []
@@ -461,8 +489,11 @@ def build_system_prompt(user, history):
     """偏好 + 攻略 统一知识库 RAG → 系统提示。"""
     sp = SYSTEM_PROMPT
     last_user = next((m["content"] for m in reversed(history) if m["role"] == "user"), None)
+    kb_hits, kb_tags = 0, []
     if last_user:
         kbs = search_knowledge(user["id"], last_user, 6)
+        kb_hits = len(kbs)
+        kb_tags = [item["tag"] for item in kbs]
         if kbs:
             lines = "\n".join(f"- {item['tag']} {item['text']}" for item in kbs)
             sp += (f"\n\n【个人知识库（偏好 + 攻略，按相关度从高到低）】\n{lines}\n"
@@ -470,6 +501,11 @@ def build_system_prompt(user, history):
     mem = memory_texts(user["id"], 10)
     if mem:
         sp += "\n\n【用户长期记忆（历次对话沉淀）】\n" + "\n".join(f"- {t}" for t in mem)
+    # 可观测性：这次到底检到了什么，必须留痕。
+    # 0 命中也要记 —— 排查时「没有记录」和「记录了 0」是两件完全不同的事。
+    log_llm_call(link="chat", event="system_prompt",
+                 user_id=user.get("id", ""), query=(last_user or "")[:200],
+                 kb_hits=kb_hits, kb_tags=kb_tags, mem_count=len(mem), prompt=sp)
     return sp
 
 
@@ -525,6 +561,46 @@ def _dump(model):
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
+
+
+# ---------------- 日志辅助（可观测性） ----------------
+def _clip(v, n=100):
+    """把一个参数值压成 ≤n 字符的字符串。
+
+    为什么不是只截字符串：参数值可能是数字/列表/嵌套字典，
+    只截 str 的话，一个长列表照样能把日志撑到几 KB。
+    统一序列化再截，**一条记录的体积就有硬上限**（与取值类型无关）。
+    """
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _tool_args_for_log(tool_acc):
+    """把流式累积的 tool_acc 整理成可落盘的 tool_args（Q10）。
+
+    背景：只有 tool_names 时，4 次 get_weather 分不清是
+    「同一城市查了 4 遍」（该去重）还是「4 个城市各查一次」（合理扇出）——
+    这两种情况的修复方向完全相反，而名字这个字段区分不了。
+
+    ⚠️ 关键：本函数**不在** log_llm_call 自己的 try 里。它一旦抛异常，
+    会顺着 generate() 往上抛、**直接打断 SSE 流**（旁路原则：
+    日志坏了不能让用户请求失败）。所以解析必须在这里就地兜住。
+    """
+    out = []
+    for i in sorted(tool_acc):
+        slot = tool_acc[i]
+        raw = (slot.get("arguments") or "").strip()
+        try:
+            args = json.loads(raw) if raw else {}
+        except Exception:
+            args = None
+        if not isinstance(args, dict):
+            # 参数不是合法 JSON，或模型给了个数组/字符串。
+            # 不丢弃 —— 原样留一段，排查时至少能看到模型吐了什么。
+            args = {"_raw": raw[:100]}
+        out.append({"name": slot.get("name", ""),
+                    "args": {k: _clip(v) for k, v in args.items()}})
+    return out
 
 
 # ---------------- 健康检查（供 Docker/K8s 探活） ----------------
@@ -735,7 +811,7 @@ def api_prefs_import(body: ImportIn, request: Request):
         content = llm_complete([
             {"role": "system", "content": "你是旅行偏好提取助手。从资料中提取明确的旅行偏好。只输出 JSON 字符串数组，每项不超过 40 字；没有则输出 []。不要输出其它内容。"},
             {"role": "user", "content": text[:20000]},
-        ], temperature=0.2, max_tokens=800)
+        ], temperature=0.2, max_tokens=800, role="偏好提取")
         m = re.search(r"\[[\s\S]*\]", content)
         parsed = json.loads(m.group(0) if m else content)
         items = []
@@ -874,7 +950,9 @@ def api_chat(body: ChatIn, request: Request):
                 return {"error": f"工具执行失败：{ex}"}
 
         final_answer = ""
+        tool_summaries = []      # 记录这一轮请求里已查到的工具摘要，跑满上限时用来降级返回
         for _round in range(MAX_TOOL_ROUNDS):
+            t0 = time.time()
             payload = {"model": OPENAI_MODEL, "stream": True, "messages": messages,
                        "temperature": 0.7, "tools": TOOL_DEFS, "tool_choice": "auto"}
             assistant_parts = []
@@ -927,6 +1005,17 @@ def api_chat(body: ChatIn, request: Request):
 
             round_content = "".join(assistant_parts)
             print(f"[chat] round {_round + 1}: finish={finish_reason}, tool_calls={len(tool_acc)}")
+            # 可观测性：每一轮真实耗时 + 是否触发工具，落一条结构化记录
+            # tool_names 是实测后补的字段：只有 has_tool_calls 时，
+            # 看到"这轮调了 7 个工具"却查不出是哪 7 个 —— 排查时不够用。
+            # tool_args 是第二次实测后补的：知道是哪 7 个工具之后，
+            # 还是分不清「同名同参=真重复」和「同名不同参=合理扇出」。
+            log_llm_call(link="chat", event="llm_call", role="主对话", model=OPENAI_MODEL,
+                         round=_round + 1, elapsed_ms=int((time.time() - t0) * 1000),
+                         prompt=json.dumps(messages, ensure_ascii=False),
+                         resp_len=len(round_content), has_tool_calls=bool(tool_acc),
+                         tool_names=[tool_acc[i]["name"] for i in sorted(tool_acc)],
+                         tool_args=_tool_args_for_log(tool_acc))
 
             if finish_reason == "tool_calls" and tool_acc:
                 tool_calls = [tool_acc[idx] for idx in sorted(tool_acc)]
@@ -952,6 +1041,8 @@ def api_chat(body: ChatIn, request: Request):
                         else:
                             summary = summarize_tool(v["name"], result)
                         yield sse({"type": "tool", "name": v["name"], "summary": summary})
+                        if summary not in tool_summaries:
+                            tool_summaries.append(summary)
                         messages.append(
                             {"role": "tool", "tool_call_id": v["id"],
                              "content": json.dumps(result, ensure_ascii=False)}
@@ -961,9 +1052,22 @@ def api_chat(body: ChatIn, request: Request):
             final_answer = round_content
             break
         else:
-            yield sse({"type": "error",
-                       "message": f"模型连续 {MAX_TOOL_ROUNDS} 轮都在调用工具，仍未完成任务。"})
-            return
+            # 跑满上限：不再直接报错丢弃，改成「降级返回」——
+            # 把已经查到的工具结果整理给用户，并且照常存进对话历史，
+            # 不让前面几轮花掉的 token 和时间白费。
+            if tool_summaries:
+                final_answer = (
+                    f"我连续查询了 {MAX_TOOL_ROUNDS} 轮，还是没能整理出完整方案。\n\n"
+                    "先把已经查到的信息给你：\n"
+                    + "\n".join(f"- {s}" for s in tool_summaries)
+                    + "\n\n你可以换个说法再问一次，或者把需求拆开问（比如先问天气、再问酒店）。"
+                )
+            else:
+                final_answer = (
+                    f"我连续查询了 {MAX_TOOL_ROUNDS} 轮，仍未拿到有效结果。"
+                    "请换个说法再问一次，或者把需求拆开问。"
+                )
+            yield sse({"type": "delta", "content": final_answer})
 
         assistant_content = final_answer
 

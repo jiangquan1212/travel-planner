@@ -82,9 +82,109 @@ def _seed(*parts):
     return int(h[:8], 16)
 
 
-def get_weather(city):
-    """真实天气（Open-Meteo），缓存 30 分钟。"""
-    cache_key = f"weather:{city}"
+AMAP_GEO_URL = "https://restapi.amap.com/v3/geocode/geo"
+
+# 省 / 直辖市 / 自治区 → 高德 adcode 的前两位。
+# 用途：拿到多条候选时，用它判断哪一条落在期望的省级行政区里（Q11 的校验层）。
+_PROV_ADCODE = {
+    "北京": "11", "天津": "12", "河北": "13", "山西": "14", "内蒙古": "15",
+    "辽宁": "21", "吉林": "22", "黑龙江": "23", "上海": "31", "江苏": "32",
+    "浙江": "33", "安徽": "34", "福建": "35", "江西": "36", "山东": "37",
+    "河南": "41", "湖北": "42", "湖南": "43", "广东": "44", "广西": "45",
+    "海南": "46", "重庆": "50", "四川": "51", "贵州": "52", "云南": "53",
+    "西藏": "54", "陕西": "61", "甘肃": "62", "青海": "63", "宁夏": "64",
+    "新疆": "65",
+}
+
+
+def _geocode(city, province=""):
+    """城市名 → {"lat", "lon", "resolved"}；失败返回 {"error": ...}。
+
+    为什么是两个数据源（2026-09-23 实测，见 experiments/q11_geocode_census.py）：
+    - Open-Meteo 的 geocoding 传 `language=zh` 时，是**拿中文名去匹配条目**，
+      而它库里中国大城市的主名是拼音，中文名多挂在**同名小村镇**上 ——
+      实测项目内置 16 城**只有 10 个对**，其中 5 个**静默返回别省**的同名地点。
+    - 高德是国内数据源，中文明细齐；同一批城市实测 **12/12 全对**。
+    → 优先高德；没配 AMAP_KEY 或高德调用失败时回落 Open-Meteo。
+
+    为什么要校验、为什么要报错（**这一层跟数据源无关，两个源都必须做**）：
+    - **换数据源降低的是【概率】，"无条件信第一条"决定的是【性质】。**
+      高德同样会返回多条同名候选，实测：
+        西湖 → 台湾省苗栗县西湖乡 排第 1，**浙江省杭州市西湖区排第 3**
+        新城 → 台湾省花莲县新城乡 排第 1，陕西省西安市新城区 排第 2
+      直接取第一条 → 返回另一个城市的天气，**坐标合法、天气真实、全程不报错**。
+    - 所以这里做两件事：
+      ① 给了 province → 只认 adcode 落在该省的候选；一条都没有 → **返回 error**
+      ② 没给 province 且候选多于一条 → **不猜**，返回"地名有歧义"的 error
+    → 原则：**宁可报错让上层/用户知道没查准，也不静默拿别省的数据往下写。**
+    """
+    key = os.environ.get("AMAP_KEY", "").strip()
+    if key:
+        try:
+            # ⚠️ 省份必须拼进 address，**不能**用高德的 `city` 参数：
+            #    实测 address=白沙 + city=海南 → 直接 0 条，
+            #    而 address=海南省白沙 → 正确拿到「海南省白沙黎族自治县」。
+            #    高德的 `city` 参数不是"省份过滤器"，传进去会把查询收成空。
+            addr = f"{province}{city}" if province else city
+            data = requests.get(AMAP_GEO_URL,
+                                params={"address": addr, "key": key, "output": "json"},
+                                timeout=15).json()
+            geos = (data.get("geocodes") or []) if data.get("status") == "1" else []
+            pref = _PROV_ADCODE.get(province) if province else None
+            picked = None
+            if pref:
+                picked = next((g for g in geos
+                               if str(g.get("adcode", ""))[:2] == pref), None)
+                if not geos:
+                    return {"error": f"未找到地名「{city}」"}
+                if not picked:
+                    return {"error": f"地名「{city}」在{province}没有匹配地点；"
+                                     f"其余 {len(geos)} 条同名地点在其他省份，未采用"}
+            elif len(geos) == 1:
+                picked = geos[0]
+            else:
+                # 没给省份时：**只认唯一的「市 / 省」级候选**。
+                # 实测 level 就是这个用途：
+                #   西安 → [陕西省西安市(市), 黑龙江牡丹江市西安区(区县), 吉林辽源市西安区(区县)]
+                #          → 唯一的"市"级 = 西安 ✅
+                #   西湖 → [苗栗县西湖乡, 南昌市西湖区, 杭州市西湖区] 全是"区县"级
+                #          → 有歧义，报错 ✅（宁可报错，也不能猜一个杭州西湖给用户）
+                top = [g for g in geos if g.get("level") in ("市", "省")]
+                if len(top) == 1:
+                    picked = top[0]
+                else:
+                    same = top or geos
+                    names = "、".join(g.get("formatted_address", "?") for g in same[:3])
+                    return {"error": f"地名「{city}」有歧义（{len(same)} 个同名地点："
+                                     f"{names}…），请补充省份后再查"}
+            if picked:
+                lon, _, lat = (picked.get("location") or "").partition(",")
+                if lon and lat:
+                    return {"lat": float(lat), "lon": float(lon),
+                            "resolved": picked.get("formatted_address") or city}
+        except Exception:
+            pass          # 高德不可用不算错误，交给下面的回落
+    try:
+        res = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                           params={"name": city, "count": 1, "language": "zh",
+                                   "format": "json"},
+                           timeout=15).json().get("results") or []
+    except Exception:
+        return {"error": f"未找到城市：{city}"}
+    if not res:
+        return {"error": f"未找到城市：{city}"}
+    loc = res[0]
+    return {"lat": loc.get("latitude"), "lon": loc.get("longitude"),
+            "resolved": loc.get("name") or city}
+
+
+def get_weather(city, province=""):
+    """真实天气（Open-Meteo），缓存 30 分钟。
+
+    province 可选：用户明确提到省份时传进来（如「江西婺源」→ city=婺源, province=江西），
+    用于消解同名地名 —— 不传时会退化成"多候选就报错"。
+    """
+    cache_key = f"weather:{province}:{city}"
     hit = cache_get(cache_key)
     if hit:
         try:
@@ -92,21 +192,21 @@ def get_weather(city):
         except Exception:
             pass
     try:
-        geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
-                           params={"name": city, "count": 1, "language": "zh", "format": "json"},
-                           timeout=15).json().get("results") or []
-        if not geo:
-            return {"error": f"未找到城市：{city}"}
-        loc = geo[0]
+        loc = _geocode(city, province)
+        if "error" in loc:
+            return loc
         w = requests.get("https://api.open-meteo.com/v1/forecast",
-                         params={"latitude": loc["latitude"], "longitude": loc["longitude"],
+                         params={"latitude": loc["lat"], "longitude": loc["lon"],
                                  "current_weather": "true",
                                  "daily": "weathercode,temperature_2m_max,temperature_2m_min",
                                  "timezone": "auto", "forecast_days": 5},
                          timeout=15).json()
         cur = w.get("current_weather", {})
         result = {
-            "city": loc.get("name") or city,
+            "city": city,
+            # 解析到的规范地名：让「静默返回别省数据」变得可见
+            # （只看 city 看不出差异 —— 输入"青岛"、拿到辽宁的天气，两者都显示"青岛"）
+            "resolved": loc.get("resolved"),
             "temp": cur.get("temperature"),
             "windspeed": cur.get("windspeed"),
             "weathercode": cur.get("weathercode"),
@@ -188,7 +288,7 @@ def search_attractions(city):
 def execute_tool(name, args):
     args = args or {}
     if name == "get_weather":
-        return get_weather(args.get("city") or "")
+        return get_weather(args.get("city") or "", args.get("province") or "")
     if name == "search_flights":
         return search_flights(args.get("from_city") or "", args.get("to_city") or "",
                               args.get("date") or "2026-09-01")
@@ -233,8 +333,15 @@ def summarize_tool(name, result):
 TOOL_DEFS = [
     {"type": "function", "function": {
         "name": "get_weather", "description": "查询指定城市当前的实时天气与未来几天预报",
-        "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名，如 杭州"}},
-                       "required": ["city"]}}},
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string", "description": "城市名，如 杭州"},
+            # 用户话里提到省份/所属大区时必须带上 —— 中国有大量同名地名
+            # （西湖/新城/白沙/太平…），不带省份会被判为歧义而查不到。
+            "province": {"type": "string",
+                         "description": "省份或直辖市，如 江西、浙江。"
+                                        "用户问题里提到省份时【必须】一起传，"
+                                        "否则遇到同名地名会返回歧义错误"}},
+            "required": ["city"]}}},
     {"type": "function", "function": {
         "name": "search_flights", "description": "查询两个城市之间的航班（含价格）",
         "parameters": {"type": "object", "properties": {

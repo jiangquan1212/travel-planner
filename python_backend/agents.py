@@ -2,6 +2,7 @@
 """多 Agent 协作（结合真实工具）：
 先并行预取 天气/航班/酒店/景点 工具数据，再交给专业 Agent 分工生成，最后总协调者汇总。
 """
+import json
 import os
 import re
 import time
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+from llm_log import log_llm_call
 from tools import get_weather, search_attractions, search_flights, search_hotels
 
 
@@ -21,10 +23,11 @@ def _cfg():
     }
 
 
-def llm_complete(messages, temperature=0.7, max_tokens=1500, model=None):
+def llm_complete(messages, temperature=0.7, max_tokens=1500, model=None, role=""):
     cfg = _cfg()
     if not cfg["key"]:
         raise RuntimeError("AI 未配置")
+    t0 = time.time()
     resp = requests.post(
         f"{cfg['base']}/chat/completions",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {cfg['key']}"},
@@ -34,7 +37,13 @@ def llm_complete(messages, temperature=0.7, max_tokens=1500, model=None):
     )
     resp.raise_for_status()
     data = resp.json()
-    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    # 可观测性：role 由调用方传入，不靠猜 prompt 开头来定位是谁在调
+    log_llm_call(link="agents", event="llm_call", role=role, model=model or cfg["model"],
+                 round=1, elapsed_ms=int((time.time() - t0) * 1000),
+                 prompt=json.dumps(messages, ensure_ascii=False),
+                 resp_len=len(content), has_tool_calls=False)
+    return content
 
 
 # ---------- 工具结果压缩 ----------
@@ -84,7 +93,8 @@ def _budget_agent(user_request, prefs, city, flights_txt, hotels_txt, attraction
         f"【航班工具】{flights_txt}\n【酒店工具】{hotels_txt}\n【景点工具】{attractions_txt}"
     )
     return llm_complete([{"role": "system", "content": "你只输出中文预算方案。"},
-                         {"role": "user", "content": prompt}], temperature=0.4, max_tokens=700)
+                         {"role": "user", "content": prompt}], temperature=0.4, max_tokens=700,
+                        role="预算Agent")
 
 
 def _itinerary_agent(user_request, prefs, city, weather_txt, attractions_txt):
@@ -96,7 +106,8 @@ def _itinerary_agent(user_request, prefs, city, weather_txt, attractions_txt):
         f"【天气工具】{weather_txt}\n【景点工具】{attractions_txt}"
     )
     return llm_complete([{"role": "system", "content": "你只输出中文按天行程。"},
-                         {"role": "user", "content": prompt}], temperature=0.6, max_tokens=1100)
+                         {"role": "user", "content": prompt}], temperature=0.6, max_tokens=1100,
+                        role="行程Agent")
 
 
 def _coordinator(user_request, city, weather_txt, budget, itinerary):
@@ -107,7 +118,8 @@ def _coordinator(user_request, city, weather_txt, budget, itinerary):
         f"【行程 Agent】\n{itinerary}\n\n【预算 Agent】\n{budget}\n\n【天气 Agent】\n{weather_txt}"
     )
     return llm_complete([{"role": "system", "content": "你是中文旅行规划总协调者。"},
-                         {"role": "user", "content": prompt}], temperature=0.5, max_tokens=1600)
+                         {"role": "user", "content": prompt}], temperature=0.5, max_tokens=1600,
+                        role="总协调Agent")
 
 
 def _guess_from_city(request):
