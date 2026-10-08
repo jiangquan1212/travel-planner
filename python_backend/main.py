@@ -67,9 +67,13 @@ PORT = int(os.environ.get("PORT", 3000))
 HOST = os.environ.get("HOST", "127.0.0.1")
 MAX_HISTORY = 20
 MAX_FILE_BYTES = 3 * 1024 * 1024
+MAX_TOOL_ROUNDS = 5
 FEEDBACK_CATEGORIES = ("建议", "问题反馈", "功能需求", "其他")
 
 SYSTEM_PROMPT = """你是"旅行规划师"，一位经验丰富的资深旅游顾问，擅长为不同人群定制多方位旅行计划。
+
+当用户需要天气、航班、酒店、景点或实时价格信息时，你必须先调用对应工具获取真实数据，
+拿到工具结果后再回答；不能只凭记忆编造这些实时信息。
 
 当用户提出旅行规划需求时，请尽量从以下多个方面给出全面、具体的建议（根据用户需求取舍，不必每项都罗列）：
 1. 目的地推荐与最佳出行时间（含季节/天气说明）
@@ -86,7 +90,8 @@ SYSTEM_PROMPT = """你是"旅行规划师"，一位经验丰富的资深旅游�
 - 默认使用中文回复；条理清晰，可用小标题、加粗和列表
 - 如果关键信息不足（如天数、人数、预算、出发地），先简要提出 1-2 个问题补充，或给出合理假设并在开头说明"按 XX 假设"
 - 如果用户只是闲聊或咨询其他旅行相关问题，正常友好回答
-- 不要编造真实的价格区间之外过于精确的信息，给出区间即可"""
+- 不要编造真实的价格区间之外过于精确的信息，给出区间即可
+- 如果一次工具调用还不够，可以继续调用其他工具，直到拿到足够信息再给出最终方案"""
 
 app = FastAPI(title="Travel Planner API", version="2.0.0",
               description="基于 RAG 检索增强生成的 AI 旅行助手（FastAPI 版）")
@@ -853,91 +858,44 @@ def api_chat(body: ChatIn, request: Request):
                                           "Authorization": f"Bearer {OPENAI_API_KEY}"},
                                  json=payload, stream=True, timeout=120)
 
-        # ---- 第一轮：带 Function Calling 工具 ----
-        payload = {"model": OPENAI_MODEL, "stream": True, "messages": messages,
-                   "temperature": 0.7, "tools": TOOL_DEFS, "tool_choice": "auto"}
-        assistant_parts = []
-        tool_acc = {}
-        finish_reason = None
-        try:
-            resp = call_stream(payload)
-        except Exception as ex:
-            yield sse({"type": "error", "message": f"无法连接 AI 服务：{ex}"})
-            return
-        if resp.status_code != 200:
-            detail = ""
+        def run_tool_call(tool_call):
+            """执行单个工具；参数非法或执行失败时把错误作为结果交给模型。"""
             try:
-                detail = resp.json().get("error", {}).get("message", "")
-            except Exception:
-                detail = resp.text[:200]
-            yield sse({"type": "error", "message": f"AI 服务返回错误（HTTP {resp.status_code}）：{detail}"})
-            return
-
-        for raw in resp.iter_lines(decode_unicode=False):
-            if not raw:
-                continue
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                obj = json.loads(data)
-            except Exception:
-                continue
-            choice = (obj.get("choices") or [{}])[0]
-            delta = choice.get("delta", {})
-            if delta.get("content"):
-                assistant_parts.append(delta["content"])
-                yield sse({"type": "delta", "content": delta["content"]})
-            for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
-                slot = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                if tc.get("function", {}).get("name"):
-                    slot["name"] = tc["function"]["name"]
-                if tc.get("function", {}).get("arguments"):
-                    slot["arguments"] += tc["function"]["arguments"]
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
-
-        assistant_content = "".join(assistant_parts)
-
-        # ---- 执行工具（并行）并进入第二轮 ----
-        if finish_reason == "tool_calls" and tool_acc:
-            assistant_msg = {"role": "assistant", "content": assistant_content or None,
-                             "tool_calls": [{"id": v["id"], "type": "function",
-                                             "function": {"name": v["name"], "arguments": v["arguments"]}}
-                                            for v in tool_acc.values()]}
-            messages.append(assistant_msg)
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(execute_tool, v["name"], json.loads(v["arguments"] or "{}")): v
-                           for v in tool_acc.values()}
-                for f in futures:
-                    v = futures[f]
-                    result = f.result()
-                    if v["name"] == "get_weather" and isinstance(result, dict) and "error" in result:
-                        # 偶发网络失败时自动重试一次，避免行程里出现“天气获取失败”
-                        try:
-                            time.sleep(0.8)
-                            result = execute_tool(v["name"], json.loads(v["arguments"] or "{}"))
-                        except Exception:
-                            pass
-                    yield sse({"type": "tool", "name": v["name"],
-                               "summary": summarize_tool(v["name"], result)})
-                    messages.append({"role": "tool", "tool_call_id": v["id"],
-                                     "content": json.dumps(result, ensure_ascii=False)})
-
-            try:
-                resp2 = call_stream({"model": OPENAI_MODEL, "stream": True,
-                                     "messages": messages, "temperature": 0.7})
+                args = json.loads(tool_call["arguments"] or "{}")
             except Exception as ex:
-                yield sse({"type": "error", "message": f"工具调用后无法连接 AI：{ex}"})
-                return
+                return {"error": f"工具参数不是合法 JSON：{ex}"}
+            try:
+                result = execute_tool(tool_call["name"], args)
+                if tool_call["name"] == "get_weather" and isinstance(result, dict) and "error" in result:
+                    time.sleep(0.8)
+                    result = execute_tool(tool_call["name"], args)
+                return result
+            except Exception as ex:
+                return {"error": f"工具执行失败：{ex}"}
+
+        final_answer = ""
+        for _round in range(MAX_TOOL_ROUNDS):
+            payload = {"model": OPENAI_MODEL, "stream": True, "messages": messages,
+                       "temperature": 0.7, "tools": TOOL_DEFS, "tool_choice": "auto"}
             assistant_parts = []
-            for raw in resp2.iter_lines(decode_unicode=False):
+            tool_acc = {}
+            finish_reason = None
+            try:
+                resp = call_stream(payload)
+            except Exception as ex:
+                yield sse({"type": "error", "message": f"无法连接 AI 服务：{ex}"})
+                return
+            if resp.status_code != 200:
+                detail = ""
+                try:
+                    detail = resp.json().get("error", {}).get("message", "")
+                except Exception:
+                    detail = resp.text[:200]
+                yield sse({"type": "error",
+                           "message": f"AI 服务返回错误（HTTP {resp.status_code}）：{detail}"})
+                return
+
+            for raw in resp.iter_lines(decode_unicode=False):
                 if not raw:
                     continue
                 line = raw.decode("utf-8", "replace").strip()
@@ -947,13 +905,67 @@ def api_chat(body: ChatIn, request: Request):
                 if data == "[DONE]":
                     break
                 try:
-                    delta = (json.loads(data).get("choices") or [{}])[0].get("delta", {})
+                    obj = json.loads(data)
                 except Exception:
                     continue
+                choice = (obj.get("choices") or [{}])[0]
+                delta = choice.get("delta", {})
                 if delta.get("content"):
                     assistant_parts.append(delta["content"])
                     yield sse({"type": "delta", "content": delta["content"]})
-            assistant_content = "".join(assistant_parts)
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if tc.get("function", {}).get("name"):
+                        slot["name"] = tc["function"]["name"]
+                    if tc.get("function", {}).get("arguments"):
+                        slot["arguments"] += tc["function"]["arguments"]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+            round_content = "".join(assistant_parts)
+            print(f"[chat] round {_round + 1}: finish={finish_reason}, tool_calls={len(tool_acc)}")
+
+            if finish_reason == "tool_calls" and tool_acc:
+                tool_calls = [tool_acc[idx] for idx in sorted(tool_acc)]
+                print(f"[chat] round {_round + 1}: " +
+                      ", ".join(v["name"] for v in tool_calls))
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": round_content or None,
+                    "tool_calls": [
+                        {"id": v["id"], "type": "function",
+                         "function": {"name": v["name"], "arguments": v["arguments"]}}
+                        for v in tool_calls
+                    ],
+                }
+                messages.append(assistant_msg)
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(run_tool_call, v) for v in tool_calls]
+                    for v, future in zip(tool_calls, futures):
+                        result = future.result()
+                        if isinstance(result, dict) and "error" in result:
+                            summary = f"{v['name']} 失败：{result['error']}"
+                        else:
+                            summary = summarize_tool(v["name"], result)
+                        yield sse({"type": "tool", "name": v["name"], "summary": summary})
+                        messages.append(
+                            {"role": "tool", "tool_call_id": v["id"],
+                             "content": json.dumps(result, ensure_ascii=False)}
+                        )
+                continue
+
+            final_answer = round_content
+            break
+        else:
+            yield sse({"type": "error",
+                       "message": f"模型连续 {MAX_TOOL_ROUNDS} 轮都在调用工具，仍未完成任务。"})
+            return
+
+        assistant_content = final_answer
 
         if assistant_content.strip():
             conv_existed = bool(body.conversationId and conversations_coll.get(body.conversationId))

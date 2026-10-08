@@ -10,6 +10,7 @@ import re
 import secrets
 from datetime import datetime, timezone
 
+from embeddings import dense_cosine, embed_text, embed_texts, embedding_enabled
 from vector_store import tokenize, _cosine
 
 CHUNK_SIZE = 500
@@ -95,6 +96,24 @@ class GuideStore:
                 user_map[cid] = vec
             self._index[uid] = user_map
 
+    def _ensure_embeddings(self, user_id):
+        """给历史攻略块补充 embedding；API 不可用时保持词法回退。"""
+        if not embedding_enabled():
+            return False
+        chunks = [ch for d in self.docs if d.get("userId") == user_id
+                  for ch in d.get("chunks", []) if ch.get("embedding") is None]
+        if not chunks:
+            return True
+        try:
+            vectors = embed_texts([ch["text"] for ch in chunks])
+            for chunk, vec in zip(chunks, vectors):
+                chunk["embedding"] = vec
+            self._save()
+            return True
+        except Exception as e:
+            print(f"[guide] embedding 批量生成失败，将使用词法检索: {e}")
+            return False
+
     def add(self, user_id, filename, text):
         text = text.strip()
         if not text:
@@ -102,11 +121,19 @@ class GuideStore:
         chunks = split_chunks(text)
         if not chunks:
             return {"error": "未能从文档中切分出内容"}
+        chunk_objs = [{"id": secrets.token_hex(6), "text": c} for c in chunks]
+        if embedding_enabled():
+            try:
+                vectors = embed_texts([c["text"] for c in chunk_objs])
+                for chunk, vec in zip(chunk_objs, vectors):
+                    chunk["embedding"] = vec
+            except Exception as e:
+                print(f"[guide] 新增文档 embedding 失败，将使用词法检索: {e}")
         doc = {
             "id": secrets.token_hex(8),
             "userId": user_id,
             "filename": filename,
-            "chunks": [{"id": secrets.token_hex(6), "text": c} for c in chunks],
+            "chunks": chunk_objs,
             "createdAt": _now(),
         }
         self.docs.append(doc)
@@ -130,6 +157,31 @@ class GuideStore:
                 for d in self.docs if d["userId"] == user_id]
 
     def search(self, user_id, query, top_k=4):
+        if embedding_enabled() and self._ensure_embeddings(user_id):
+            try:
+                q_vec = embed_text(query)
+            except Exception as e:
+                print(f"[guide] 查询 embedding 失败，将使用词法检索: {e}")
+                q_vec = None
+            if q_vec is not None:
+                results = []
+                for d in self.docs:
+                    if d.get("userId") != user_id:
+                        continue
+                    for ch in d.get("chunks", []):
+                        vec = ch.get("embedding")
+                        if not vec:
+                            continue
+                        score = dense_cosine(q_vec, vec)
+                        if score > 0:
+                            results.append({
+                                "text": ch["text"][:300],
+                                "filename": d.get("filename", ""),
+                                "score": round(score, 4),
+                            })
+                results.sort(key=lambda r: r["score"], reverse=True)
+                return results[:top_k]
+
         q_tokens = tokenize(query)
         user_map = self._index.get(user_id, {})
         if not q_tokens or not user_map:

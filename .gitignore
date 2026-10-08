@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
 
 # 密钥与运行时数据（克隆后运行 python_backend/seed.py 生成）
 .env
@@ -12,7 +13,37 @@ data/
 outputs/
 work/
 
+# 代码打包副本（本地整理用，不提交）
+Travel-Planner-代码/
+Travel-Planner-代码.zip
+智能旅行规划师-代码/
+
+# 早期原型（本地留存，不随仓库分发）
+# Node 原型 → Flask 版 → 当前 FastAPI + Vue 3，只提交最后一套
+server.js
+package.json
+package-lock.json
+lib/
+scripts/
+python_backend/app.py
+public/js/
+public/index.html
+public/vendor/leaflet/
+public/vendor/worldmap/
+
+# 备份与临时产物
+*.bak
+*.bak_*
+*.orig
+*.tmp
+*.zip
+*_demo_calls.jsonl
+
 # 编辑器/系统
 .vscode/
+.idea/
 Thumbs.db
 .DS_Store
+
+# 本地推送辅助脚本
+推送清理后的版本.bat

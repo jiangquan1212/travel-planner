@@ -12,6 +12,8 @@ import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
+from embeddings import dense_cosine, embed_text, embed_texts, embedding_enabled
+
 MAX_TEXT_LEN = 200
 DEFAULT_CATEGORY = "其他"
 DEFAULT_WEIGHT = 3
@@ -103,6 +105,33 @@ class VectorStore:
                 user_map[docs[i]["id"]] = vec
             self._index[uid] = user_map
 
+    def _embed_or_none(self, text):
+        if not embedding_enabled():
+            return None
+        try:
+            return embed_text(text)
+        except Exception as e:
+            print(f"[vector] embedding 生成失败，将使用词法检索: {e}")
+            return None
+
+    def _ensure_embeddings(self, user_id):
+        """给历史偏好补充 embedding；API 不可用时保持词法回退。"""
+        if not embedding_enabled():
+            return False
+        docs = [d for d in self.docs
+                if d.get("userId") == user_id and d.get("embedding") is None]
+        if not docs:
+            return True
+        try:
+            vectors = embed_texts([d["text"] for d in docs])
+            for doc, vec in zip(docs, vectors):
+                doc["embedding"] = vec
+            self._save()
+            return True
+        except Exception as e:
+            print(f"[vector] embedding 批量生成失败，将使用词法检索: {e}")
+            return False
+
     def add(self, user_id, text, category=None, weight=None):
         text = str(text or "").strip()
         if not text:
@@ -117,6 +146,7 @@ class VectorStore:
             "text": text,
             "category": str(category or "").strip() or DEFAULT_CATEGORY,
             "weight": _norm_weight(weight),
+            "embedding": self._embed_or_none(text),
             "createdAt": _now(),
         }
         self.docs.append(doc)
@@ -140,6 +170,7 @@ class VectorStore:
                    for d in self.docs):
                 return {"error": "该偏好已存在"}
             doc["text"] = text
+            doc["embedding"] = self._embed_or_none(text)
         if "category" in patch:
             doc["category"] = str(patch.get("category") or "").strip() or DEFAULT_CATEGORY
         if "weight" in patch:
@@ -166,11 +197,40 @@ class VectorStore:
         return sorted(items, key=lambda d: d["createdAt"])
 
     def search(self, user_id, query, top_k=3):
+        docs = [d for d in self.docs if d.get("userId") == user_id]
+        if not docs:
+            return []
+
+        if embedding_enabled() and self._ensure_embeddings(user_id):
+            try:
+                q_vec = embed_text(query)
+            except Exception as e:
+                print(f"[vector] 查询 embedding 失败，将使用词法检索: {e}")
+                q_vec = None
+            if q_vec is not None:
+                results = []
+                for doc in docs:
+                    vec = doc.get("embedding")
+                    if not vec:
+                        continue
+                    score = dense_cosine(q_vec, vec)
+                    if score > 0:
+                        w = doc.get("weight", DEFAULT_WEIGHT)
+                        boosted = score * (0.5 + 0.5 * w / 5.0)
+                        results.append({
+                            "id": doc["id"],
+                            "text": doc["text"],
+                            "category": doc.get("category", DEFAULT_CATEGORY),
+                            "weight": w,
+                            "score": round(boosted, 4),
+                        })
+                results.sort(key=lambda r: r["score"], reverse=True)
+                return results[:top_k]
+
         q_tokens = tokenize(query)
         user_vecs = self._index.get(user_id, {})
         if not q_tokens or not user_vecs:
             return []
-        docs = [d for d in self.docs if d["userId"] == user_id]
         df = {}
         for d in docs:
             for t in set(tokenize(d["text"])):

@@ -8,8 +8,8 @@
 
 ### 用户端
 - 注册 / 登录 / 退出（会话令牌支持多标签页独立登录）
-- **智能对话**：SSE 流式输出、Markdown 排版、Function Calling 多工具并行
-  （天气 / 航班 / 酒店 / 景点，页面显示 🔧 工具徽章）
+- **智能对话**：SSE 流式输出、Markdown 排版、Function Calling 多工具并行与
+  **多轮工具调用**（天气 / 航班 / 酒店 / 景点，页面显示 🔧 工具徽章）
 - **我的知识库（RAG）**：
   - ⭐ 旅行偏好：手动添加 / 删除，重要度加权
   - 📄 偏好导入：上传 PDF / TXT，AI 提取或自动分句后入库
@@ -70,19 +70,24 @@ AMAP_KEY=你的高德Web服务Key   # 可选：酒店/景点用高德真实数�
 ## 项目结构
 
 ```
-python_backend/        # FastAPI 后端（main.py / auth / tools / agents / vector_store / ...）
-public/vue-app/        # Vue 3 唯一前端（index.html + app.js）
-public/css/style.css   # 公共样式
-public/vendor/vue/     # 本地 Vue 3 构建（离线可用）
-data/                  # JSON 数据（users/sessions/conversations/preferences/guides/...）
-outputs/               # 文档：README / 部署上线指南 / 里程碑说明 / PPT / 报告
-work/                  # 开发与自动化验证脚本（Playwright/Python）
-.env                   # DeepSeek / 高德等密钥（勿外传）
+python_backend/          # FastAPI 后端
+  main.py                #   唯一入口：路由 / 会话 / RAG / SSE / Agent 编排
+  db.py                  #   存储层（SQLite：索引 + 事务）
+  vector_store.py        #   向量检索；rerank.py = RRF 混合重排（向量 + BM25）
+  embeddings.py          #   向量化（硅基流动）
+  agents.py              #   多 Agent：4 路工具并行预取 → 3 Agent 分工 → 协调汇总
+  tools.py / providers.py#   工具实现（天气 / 航班 / 酒店 / 景点）与真实数据接入
+  eval_rag.py            #   RAG 评测脚本（Recall@1）
+  tests/                 #   pytest 用例
+public/vue-app/          # Vue 3 前端（index.html + app.js，零构建、单组件）
+public/css/style.css     # 公共样式
+public/vendor/vue/       # 本地 Vue 3 构建（离线可用，自带模板编译器）
+.github/workflows/       # CI：push / PR 自动跑 pytest
+Dockerfile               # 镜像（分层构建缓存 + HEALTHCHECK）
+docker-compose.yml       # app + redis 编排
+data/                    # 运行时数据（SQLite / JSON，不入库；由 seed.py 生成）
+.env                     # DeepSeek / 高德等密钥（不入库，见 .env.example）
 ```
-
-> 早期 Node 原型（`server.js` / `lib/` / `scripts/`）与 Flask 版
-> （`python_backend/app.py`）为课程演进遗留代码，与当前 FastAPI + Vue 3 不冲突；
-> 不需要时可自行删除，不影响运行。
 
 ## 主要接口
 

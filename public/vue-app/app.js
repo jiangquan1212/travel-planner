@@ -56,7 +56,7 @@ createApp({
       authMode: 'login', username: '', password: '', regEmail: '', authHint: '', authBusy: false,
       view: 'chat', kbTab: 'kb',
       messages: [], input: '', sending: false, convId: null, convs: [],
-      prefs: [], newPref: '', prefHint: '', prefBusy: false,
+      prefs: [], newPref: '', newPrefWeight: 3, prefHint: '', prefBusy: false,
       guides: [], guideBusy: false,
       favs: [], favHint: '', exportIdx: -1,
       profile: null, stats: null, profHint: '', profBusy: false,
@@ -227,10 +227,20 @@ createApp({
     },
     async addPref() {
       const t = this.newPref.trim(); if (!t) return;
-      try { await this.api('POST', '/api/preferences', { text: t, category: '其他', weight: 3 }); this.newPref = ''; await this.loadPrefs(); }
+      const weight = Math.max(1, Math.min(5, Number(this.newPrefWeight) || 3));
+      try { await this.api('POST', '/api/preferences', { text: t, category: '其他', weight }); this.newPref = ''; await this.loadPrefs(); }
       catch (e) { this.prefHint = e.message; }
     },
     async delPref(id) { try { await this.api('DELETE', '/api/preferences/' + id); await this.loadPrefs(); } catch (e) { this.prefHint = e.message; } },
+    async setPrefWeight(p, weight) {
+      const w = Math.max(1, Math.min(5, Number(weight) || 3));
+      p.weight = w;
+      try {
+        const d = await this.api('PATCH', `/api/preferences/${p.id}`, { weight: w });
+        if (d.preference) p.weight = d.preference.weight;
+        this.prefHint = '';
+      } catch (e) { this.prefHint = e.message; }
+    },
     async onPrefFile(e) {
       const f = e.target.files[0]; if (!f) return;
       this.prefBusy = true; this.prefHint = '';
@@ -547,6 +557,13 @@ createApp({
             <div v-if="kbTab==='kb'">
               <h3 style="margin:0 0 10px">我的知识库</h3>
               <div class="field" style="margin-bottom:8px"><input v-model="newPref" placeholder="添加旅行偏好，如：喜欢美食" @keyup.enter="addPref" /></div>
+              <div class="pref-weight-row">
+                <span>重要度</span>
+                <button v-for="n in [1,2,3,4,5]" :key="n"
+                        class="star-btn" :class="{active: newPrefWeight >= n}"
+                        @click="newPrefWeight=n" :title="n + ' 星'">★</button>
+                <span class="weight-val">{{ newPrefWeight }} 星</span>
+              </div>
               <div style="display:flex;gap:8px">
                 <button class="btn primary small" @click="addPref">添加偏好</button>
                 <label class="btn small" style="cursor:pointer;margin:0">{{ prefBusy ? '导入中…' : '📄 上传 PDF/TXT' }}
@@ -555,9 +572,14 @@ createApp({
               </div>
               <p class="hint">{{ prefHint }}</p>
               <div v-if="prefs.length" style="margin-top:10px">
-                <div v-for="p in prefs" :key="p.id" class="pref-item-v">
-                  <span>{{ p.text }} <span style="color:#f59e0b">★{{ p.weight||3 }}</span></span>
-                  <button class="mini" @click="delPref(p.id)">×</button>
+                <div v-for="p in prefs" :key="p.id" class="pref-item-v rateable">
+                  <span class="pref-text">{{ p.text }}</span>
+                  <span class="pref-stars">
+                    <button v-for="n in [1,2,3,4,5]" :key="n"
+                            class="star-btn" :class="{active: (p.weight||3) >= n}"
+                            @click="setPrefWeight(p,n)" :title="n + ' 星'">★</button>
+                  </span>
+                  <button class="mini del" @click="delPref(p.id)">×</button>
                 </div>
               </div>
               <div style="margin-top:16px;border-top:1px dashed var(--border);padding-top:12px">

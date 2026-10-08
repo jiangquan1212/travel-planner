@@ -64,6 +64,15 @@
       padding: 3px 10px; font-size: 12px; font-weight: 600; }
     .pref-item-v { background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:6px 8px;
       font-size:13px; display:flex; justify-content:space-between; gap:6px; margin-bottom:6px; }
+    .pref-item-v.rateable { flex-wrap:wrap; align-items:center; }
+    .pref-item-v .pref-text { flex:1 1 100%; min-width:0; }
+    .pref-item-v .pref-stars { display:flex; align-items:center; gap:2px; }
+    .pref-item-v .del { font-size:15px; margin-left:auto; }
+    .pref-weight-row { display:flex; align-items:center; gap:5px; margin:0 0 8px; font-size:13px; color:var(--muted); }
+    .pref-weight-row .weight-val { min-width:38px; }
+    .star-btn { background:none; border:none; padding:0 2px; font-size:18px; line-height:1; color:#cbd5e1; cursor:pointer; }
+    .star-btn:hover { color:#fbbf24; }
+    .star-btn.active { color:#f59e0b; }
   </style>
 </head>
 <body>

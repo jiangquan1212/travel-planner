@@ -36,3 +36,4 @@ def test_remove(tmp_path):
     doc = vs.add("u1", "删除我")["doc"]
     assert vs.remove("u1", doc["id"])
     assert not vs.remove("u1", doc["id"])
+

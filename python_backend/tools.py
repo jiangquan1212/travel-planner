@@ -212,7 +212,8 @@ def summarize_tool(name, result):
         if not flights:
             return "航班：暂无"
         low = min(f["price"] for f in flights)
-        return f"航班：{result['from']}→{result['to']} 最低 ¥{low}"
+        tag = "（内置演示，非实时）" if result.get("source", "").startswith("内置") else ""
+        return f"航班：{result['from']}→{result['to']} 最低 ¥{low}{tag}"
     if name == "search_hotels":
         hs = result.get("hotels", [])
         if not hs:
@@ -221,9 +222,11 @@ def summarize_tool(name, result):
         if not priced:
             return f"酒店：{result.get('city', '')} {len(hs)} 家真实酒店（高德，含地址/电话）"
         low = min(priced)
-        return f"酒店：{result.get('city', '')} 最低 ¥{low}/晚"
+        tag = "（内置演示，非实时）" if result.get("source", "").startswith("内置") else ""
+        return f"酒店：{result.get('city', '')} 最低 ¥{low}/晚{tag}"
     if name == "search_attractions":
-        return f"景点：{result['city']} {len(result.get('attractions', []))} 个推荐"
+        tag = "" if result.get("source") == "高德地图" else "（内置推荐）"
+        return f"景点：{result['city']} {len(result.get('attractions', []))} 个推荐{tag}"
     return f"工具：{name}"
 
 
